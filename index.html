@@ -56,8 +56,10 @@
   .tool-btn:hover { background: var(--parchment); box-shadow: 3px 3px 6px rgba(0,0,0,0.5); }
   .tool-btn.save { border-color: var(--red); color: var(--red); }
   .tool-btn.load { border-color: var(--gold); color: var(--gold); }
+  .tool-btn.db-btn { font-size: 12px; padding: 5px 14px; }
   #fileInput { display: none; }
   #portraitInput { display: none; }
+  #char-dropdown:focus { border-color: var(--gold); outline: none; }
 
   #sheet {
     max-width: 980px;
@@ -206,14 +208,27 @@
 
   @media print {
     body { background: white; padding: 0; }
-    #toolbar { display: none; }
+    #toolbar, #db-controls { display: none; }
     #sheet { box-shadow: none; border: none; max-width: 100%; }
   }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
 </head>
 <body>
 
 <div id="toolbar">
+  <!-- DB Controls -->
+  <div id="db-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center;width:100%;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #6b4c1e;">
+    <span style="font-family:'IM Fell English SC',serif;font-size:11px;color:#b8860b;letter-spacing:1px;white-space:nowrap;">Party Records:</span>
+    <select id="char-dropdown" style="background:#f5edd8;border:2px solid #6b4c1e;color:#1a1008;font-family:'IM Fell English SC',serif;font-size:12px;padding:5px 10px;cursor:pointer;border-radius:2px;min-width:180px;outline:none;">
+      <option value="">— Select a character —</option>
+    </select>
+    <button class="tool-btn db-btn" id="btn-load-char" onclick="dbLoadCharacter()" title="Load selected character into sheet">📜 Load</button>
+    <button class="tool-btn db-btn" id="btn-save-char" onclick="dbSaveCharacter()" title="Save current sheet to database" style="border-color:#8b1a1a;color:#8b1a1a;">⚔ Save to DB</button>
+    <button class="tool-btn db-btn" id="btn-remove-char" onclick="dbRemoveCharacter()" title="Remove selected character from database" style="border-color:#555;color:#555;">🗑 Remove</button>
+    <span id="db-status" style="font-family:'Crimson Text',serif;font-style:italic;font-size:12px;color:#a07840;min-width:120px;"></span>
+  </div>
+  <!-- File Controls -->
   <button class="tool-btn save" onclick="saveJSON()">⬇ Save as JSON</button>
   <button class="tool-btn load" onclick="document.getElementById('fileInput').click()">⬆ Load JSON</button>
   <input type="file" id="fileInput" accept=".json" onchange="loadJSON(event)">
@@ -835,6 +850,171 @@ document.addEventListener('keydown', e => {
     saveJSON();
   }
 });
+
+// =============================================
+// SQLITE DATABASE — sql.js (WASM, localStorage persistence)
+// =============================================
+
+const DB_STORAGE_KEY = 'adnd2e_characters_db';
+let SQL = null;
+let db = null;
+
+async function initDB() {
+  try {
+    SQL = await initSqlJs({
+      locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
+    });
+
+    // Try to restore existing DB from localStorage
+    const saved = localStorage.getItem(DB_STORAGE_KEY);
+    if (saved) {
+      const buf = Uint8Array.from(atob(saved), c => c.charCodeAt(0));
+      db = new SQL.Database(buf);
+    } else {
+      db = new SQL.Database();
+    }
+
+    // Create table if not exists
+    db.run(`
+      CREATE TABLE IF NOT EXISTS characters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        class TEXT,
+        race TEXT,
+        level TEXT,
+        data_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+
+    persistDB();
+    dbRefreshDropdown();
+    dbSetStatus('Tome ready', 2000);
+  } catch (err) {
+    console.error('DB init failed:', err);
+    dbSetStatus('⚠ DB unavailable', 0);
+  }
+}
+
+function persistDB() {
+  if (!db) return;
+  const data = db.export();
+  const b64 = btoa(String.fromCharCode(...data));
+  localStorage.setItem(DB_STORAGE_KEY, b64);
+}
+
+function dbSetStatus(msg, clearAfterMs = 3000) {
+  const el = document.getElementById('db-status');
+  el.textContent = msg;
+  if (clearAfterMs > 0) setTimeout(() => { el.textContent = ''; }, clearAfterMs);
+}
+
+function dbRefreshDropdown() {
+  if (!db) return;
+  const sel = document.getElementById('char-dropdown');
+  const currentVal = sel.value;
+  sel.innerHTML = '<option value="">— Select a character —</option>';
+
+  const rows = db.exec(`SELECT id, name, class, race, level FROM characters ORDER BY name ASC`);
+  if (rows.length && rows[0].values.length) {
+    rows[0].values.forEach(([id, name, cls, race, level]) => {
+      const opt = document.createElement('option');
+      opt.value = id;
+      const label = [name, cls, race ? `(${race})` : '', level ? `Lv.${level}` : ''].filter(Boolean).join(' ');
+      opt.textContent = label;
+      sel.appendChild(opt);
+    });
+  }
+
+  // Restore selection if still valid
+  if (currentVal) {
+    sel.value = currentVal;
+    if (!sel.value) sel.value = '';
+  }
+}
+
+function dbSaveCharacter() {
+  if (!db) { dbSetStatus('⚠ DB not ready'); return; }
+  const data = collectData();
+  const name = (data['character-name'] || '').trim();
+  if (!name) {
+    dbSetStatus('⚠ Character needs a name first');
+    return;
+  }
+
+  const cls = data['character/3'] || '';
+  const race = data['character/2'] || '';
+  const level = data['character/4'] || '';
+  const json = JSON.stringify({ version: 3, data });
+  const now = new Date().toISOString();
+
+  // Check if a character with this name already exists
+  const existing = db.exec(`SELECT id FROM characters WHERE name = ? LIMIT 1`, [name]);
+  if (existing.length && existing[0].values.length) {
+    const existingId = existing[0].values[0][0];
+    db.run(
+      `UPDATE characters SET class=?, race=?, level=?, data_json=?, updated_at=? WHERE id=?`,
+      [cls, race, level, json, now, existingId]
+    );
+    dbSetStatus(`✓ Updated ${name}`);
+  } else {
+    db.run(
+      `INSERT INTO characters (name, class, race, level, data_json, updated_at) VALUES (?,?,?,?,?,?)`,
+      [name, cls, race, level, json, now]
+    );
+    dbSetStatus(`✓ Saved ${name} to tome`);
+  }
+
+  persistDB();
+  dbRefreshDropdown();
+
+  // Select the saved character in dropdown
+  const rows = db.exec(`SELECT id FROM characters WHERE name = ? LIMIT 1`, [name]);
+  if (rows.length && rows[0].values.length) {
+    document.getElementById('char-dropdown').value = rows[0].values[0][0];
+  }
+}
+
+function dbLoadCharacter() {
+  if (!db) { dbSetStatus('⚠ DB not ready'); return; }
+  const sel = document.getElementById('char-dropdown');
+  const id = sel.value;
+  if (!id) { dbSetStatus('⚠ Select a character first'); return; }
+
+  const rows = db.exec(`SELECT name, data_json FROM characters WHERE id = ?`, [parseInt(id)]);
+  if (!rows.length || !rows[0].values.length) { dbSetStatus('⚠ Character not found'); return; }
+
+  const [name, json] = rows[0].values[0];
+  try {
+    const parsed = JSON.parse(json);
+    const charData = parsed.data ?? parsed;
+    populateData(charData);
+    dbSetStatus(`📜 Loaded ${name}`);
+  } catch (e) {
+    dbSetStatus('⚠ Failed to parse character data');
+  }
+}
+
+function dbRemoveCharacter() {
+  if (!db) { dbSetStatus('⚠ DB not ready'); return; }
+  const sel = document.getElementById('char-dropdown');
+  const id = sel.value;
+  if (!id) { dbSetStatus('⚠ Select a character to remove'); return; }
+
+  const rows = db.exec(`SELECT name FROM characters WHERE id = ?`, [parseInt(id)]);
+  if (!rows.length || !rows[0].values.length) { dbSetStatus('⚠ Character not found'); return; }
+  const name = rows[0].values[0][0];
+
+  if (!confirm(`Remove "${name}" from the tome? This cannot be undone.`)) return;
+
+  db.run(`DELETE FROM characters WHERE id = ?`, [parseInt(id)]);
+  persistDB();
+  dbRefreshDropdown();
+  dbSetStatus(`🗑 Removed ${name}`);
+}
+
+// Init on page load
+initDB();
 
 // =============================================
 // INIT
